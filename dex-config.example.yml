@@ -1,0 +1,14 @@
+issuer: http://localhost:5556/dex
+storage:
+  type: memory
+web:
+  http: 0.0.0.0:5556
+staticClients:
+  - id: outline-local
+    redirectURIs:
+      - 'http://localhost:8888/auth/oidc.callback'
+    name: 'Outline Local Sandbox'
+    # Set this to the same random value as DEX_CLIENT_SECRET in .env.
+    secret: replace-me
+enablePasswordDB: true
+# Add a staticPasswords entry with your own bcrypt hash and account details.

@@ -1,0 +1,19 @@
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+mcp.env
+mcp.env.*
+!mcp.env.example
+dex-config.yml
+
+# Local agent/cloud configuration
+.agents/
+.aws/
+.codex/
+.hermes-profile
+
+# Local state and editor/OS files
+*.log
+.DS_Store
+Thumbs.db

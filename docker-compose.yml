@@ -1,0 +1,450 @@
+networks:
+  sdlc-network:
+    driver: bridge
+
+volumes:
+  gitea_data:
+  plane_postgres_data:
+  plane_redis_data:
+  plane_rabbitmq_data:
+  plane_minio_data:
+  plane_proxy_config:
+  plane_proxy_data:
+  plane_logs_api:
+  plane_logs_worker:
+  plane_logs_beat:
+  plane_logs_migrator:
+  outline_postgres_data:
+  outline_redis_data:
+  outline_storage_data:
+
+# =========================================================================
+# PLANE v1.4.2 (self-host) - shared environment blocks
+# Mirrors makeplane/plane v1.4.2  deployments/cli/community/{docker-compose.yml,variables.env}
+# Credentials are supplied through the ignored local .env file.
+# =========================================================================
+x-plane-db-env: &plane-db-env
+  PGHOST: plane-db
+  PGDATABASE: plane_metadata
+  POSTGRES_USER: plane_user
+  POSTGRES_PASSWORD: ${PLANE_POSTGRES_PASSWORD:?Copy .env.example to .env and set PLANE_POSTGRES_PASSWORD}
+  POSTGRES_DB: plane_metadata
+  POSTGRES_PORT: "5432"
+  PGDATA: /var/lib/postgresql/data
+
+x-plane-redis-env: &plane-redis-env
+  REDIS_HOST: plane-redis
+  REDIS_PORT: "6379"
+  REDIS_URL: redis://plane-redis:6379/
+
+x-plane-minio-env: &plane-minio-env
+  MINIO_ROOT_USER: ${PLANE_MINIO_ROOT_USER:?Set PLANE_MINIO_ROOT_USER in .env}
+  MINIO_ROOT_PASSWORD: ${PLANE_MINIO_ROOT_PASSWORD:?Set PLANE_MINIO_ROOT_PASSWORD in .env}
+
+x-plane-s3-env: &plane-s3-env
+  AWS_REGION: ""
+  AWS_ACCESS_KEY_ID: ${PLANE_MINIO_ROOT_USER:?Set PLANE_MINIO_ROOT_USER in .env}
+  AWS_SECRET_ACCESS_KEY: ${PLANE_MINIO_ROOT_PASSWORD:?Set PLANE_MINIO_ROOT_PASSWORD in .env}
+  AWS_S3_ENDPOINT_URL: http://plane-minio:9000
+  AWS_S3_BUCKET_NAME: uploads
+
+x-plane-mq-env: &plane-mq-env
+  RABBITMQ_HOST: plane-mq
+  RABBITMQ_PORT: "5672"
+  RABBITMQ_DEFAULT_USER: ${PLANE_RABBITMQ_USER:?Set PLANE_RABBITMQ_USER in .env}
+  RABBITMQ_DEFAULT_PASS: ${PLANE_RABBITMQ_PASSWORD:?Set PLANE_RABBITMQ_PASSWORD in .env}
+  RABBITMQ_DEFAULT_VHOST: plane
+  RABBITMQ_VHOST: plane
+
+x-plane-app-env: &plane-app-env
+  # Browser-facing URL: the plane-proxy is published on 8080
+  WEB_URL: http://localhost:8080
+  CORS_ALLOWED_ORIGINS: http://localhost:8080
+  DEBUG: "0"
+  GUNICORN_WORKERS: "1"
+  API_KEY_RATE_LIMIT: 60/minute
+  USE_MINIO: "1"
+  MINIO_ENDPOINT_SSL: "0"
+  DATABASE_URL: postgresql://plane_user:${PLANE_POSTGRES_PASSWORD:?Set PLANE_POSTGRES_PASSWORD in .env}@plane-db:5432/plane_metadata
+  AMQP_URL: amqp://${PLANE_RABBITMQ_USER:?Set PLANE_RABBITMQ_USER in .env}:${PLANE_RABBITMQ_PASSWORD:?Set PLANE_RABBITMQ_PASSWORD in .env}@plane-mq:5672/plane
+  SECRET_KEY: ${PLANE_SECRET_KEY:?Set PLANE_SECRET_KEY in .env}
+  LIVE_SERVER_SECRET_KEY: ${PLANE_LIVE_SERVER_SECRET_KEY:?Set PLANE_LIVE_SERVER_SECRET_KEY in .env}
+  WEBHOOK_ALLOWED_IPS: ""
+  WEBHOOK_ALLOWED_HOSTS: ""
+
+x-plane-live-env: &plane-live-env
+  API_BASE_URL: http://api:8000
+  LIVE_SERVER_SECRET_KEY: ${PLANE_LIVE_SERVER_SECRET_KEY:?Set PLANE_LIVE_SERVER_SECRET_KEY in .env}
+
+x-plane-proxy-env: &plane-proxy-env
+  APP_DOMAIN: localhost
+  FILE_SIZE_LIMIT: "5242880"
+  BUCKET_NAME: uploads
+  # No TLS locally: empty CERT_EMAIL keeps caddy on plain HTTP at :80
+  CERT_EMAIL: ""
+  CERT_ACME_CA: https://acme-v02.api.letsencrypt.org/directory
+  CERT_ACME_DNS: ""
+  SITE_ADDRESS: ":80"
+  LISTEN_HTTP_PORT: "80"
+  LISTEN_HTTPS_PORT: "443"
+  TRUSTED_PROXIES: 0.0.0.0/0
+
+services:
+  # =========================================================================
+  # 🚀 ENGINE 1: GITEA (Git & Issue Management)
+  # =========================================================================
+  gitea:
+    image: gitea/gitea:latest
+    container_name: sdlc-gitea
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+      # Non-interactive install: skips the /install wizard. The entrypoint then
+      # runs `gitea migrate` on every boot, and the first account registered in
+      # the UI becomes the administrator.
+      - GITEA__security__INSTALL_LOCK=true
+      - GITEA__server__ROOT_URL=http://localhost:3000
+      - GITEA__service__DISABLE_REGISTRATION=false
+      # API/MCP access: mint tokens with
+      #   docker exec -u git sdlc-gitea gitea admin user generate-access-token
+      - GITEA__api__ENABLE_SWAGGER=false
+    restart: unless-stopped
+    networks:
+      - sdlc-network
+    volumes:
+      - gitea_data:/data
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "3000:3000"   # UI Port -> http://localhost:3000
+      - "2222:22"     # Git SSH Port
+
+  # =========================================================================
+  # 🚀 ENGINE 2: PLANE (Agile Sprints & Project Boards) - self-host v1.4.2
+  # 13 services: web / space / admin / live frontends, api + worker + beat +
+  # migrator (celery), postgres / redis / rabbitmq / minio, and plane-proxy
+  # which fronts them all. Published at http://localhost:8080
+  # =========================================================================
+  web:
+    image: makeplane/plane-frontend:stable
+    container_name: sdlc-plane
+    restart: unless-stopped
+    depends_on:
+      - api
+      - worker
+    networks:
+      - sdlc-network
+
+  space:
+    image: makeplane/plane-space:stable
+    container_name: plane-space
+    restart: unless-stopped
+    depends_on:
+      - api
+      - worker
+      - web
+    networks:
+      - sdlc-network
+
+  admin:
+    image: makeplane/plane-admin:stable
+    container_name: plane-admin
+    restart: unless-stopped
+    depends_on:
+      - api
+      - web
+    networks:
+      - sdlc-network
+
+  live:
+    image: makeplane/plane-live:stable
+    container_name: plane-live
+    restart: unless-stopped
+    environment:
+      <<: [*plane-live-env, *plane-redis-env]
+    depends_on:
+      - api
+      - web
+    networks:
+      - sdlc-network
+
+  api:
+    image: makeplane/plane-backend:stable
+    container_name: plane-backend
+    command: ./bin/docker-entrypoint-api.sh
+    restart: unless-stopped
+    environment:
+      <<: [*plane-app-env, *plane-db-env, *plane-redis-env, *plane-minio-env, *plane-s3-env, *plane-proxy-env]
+    volumes:
+      - plane_logs_api:/code/plane/logs
+    depends_on:
+      - plane-db
+      - plane-redis
+      - plane-mq
+    networks:
+      - sdlc-network
+
+  worker:
+    image: makeplane/plane-backend:stable
+    container_name: plane-worker
+    command: ./bin/docker-entrypoint-worker.sh
+    restart: unless-stopped
+    environment:
+      <<: [*plane-app-env, *plane-db-env, *plane-redis-env, *plane-minio-env, *plane-s3-env, *plane-proxy-env]
+    volumes:
+      - plane_logs_worker:/code/plane/logs
+    depends_on:
+      - api
+      - plane-db
+      - plane-redis
+      - plane-mq
+    networks:
+      - sdlc-network
+
+  beat-worker:
+    image: makeplane/plane-backend:stable
+    container_name: plane-beat-worker
+    command: ./bin/docker-entrypoint-beat.sh
+    restart: unless-stopped
+    environment:
+      <<: [*plane-app-env, *plane-db-env, *plane-redis-env, *plane-minio-env, *plane-s3-env, *plane-proxy-env]
+    volumes:
+      - plane_logs_beat:/code/plane/logs
+    depends_on:
+      - api
+      - plane-db
+      - plane-redis
+      - plane-mq
+    networks:
+      - sdlc-network
+
+  migrator:
+    image: makeplane/plane-backend:stable
+    container_name: plane-migrator
+    command: ./bin/docker-entrypoint-migrator.sh
+    restart: "no"
+    environment:
+      <<: [*plane-app-env, *plane-db-env, *plane-redis-env, *plane-minio-env, *plane-s3-env, *plane-proxy-env]
+    volumes:
+      - plane_logs_migrator:/code/plane/logs
+    depends_on:
+      - plane-db
+      - plane-redis
+    networks:
+      - sdlc-network
+
+  plane-db:
+    image: postgres:15-alpine
+    container_name: plane-postgres
+    command: postgres -c 'max_connections=1000'
+    environment:
+      <<: *plane-db-env
+    volumes:
+      - plane_postgres_data:/var/lib/postgresql/data
+    networks:
+      - sdlc-network
+    restart: unless-stopped
+
+  plane-redis:
+    image: redis:7-alpine
+    container_name: plane-redis
+    volumes:
+      - plane_redis_data:/data
+    networks:
+      - sdlc-network
+    restart: unless-stopped
+
+  plane-mq:
+    image: rabbitmq:3.13.6-management-alpine
+    container_name: plane-mq
+    environment:
+      <<: *plane-mq-env
+    volumes:
+      - plane_rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - sdlc-network
+    restart: unless-stopped
+
+  plane-minio:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    container_name: plane-minio
+    command: server /data --console-address ":9090"
+    environment:
+      <<: *plane-minio-env
+    volumes:
+      - plane_minio_data:/data
+    networks:
+      - sdlc-network
+    restart: unless-stopped
+
+  proxy:
+    image: makeplane/plane-proxy:stable
+    container_name: plane-proxy
+    environment:
+      <<: *plane-proxy-env
+    ports:
+      - "8080:80"     # Plane UI + API -> http://localhost:8080
+    volumes:
+      - plane_proxy_config:/config
+      - plane_proxy_data:/data
+    depends_on:
+      - web
+      - api
+      - space
+      - admin
+      - live
+    networks:
+      - sdlc-network
+    restart: unless-stopped
+
+  # =========================================================================
+  # 🤖 ENGINE 4: MCP GATEWAYS (tools for ANY MCP-capable CLI)
+  # One long-lived process per product, bound to loopback only, so every CLI
+  # points at a URL instead of each spawning its own server with its own copy
+  # of the token. Credentials live in ../mcp.env, never in this file.
+  #   http://127.0.0.1:8090/mcp  -> Gitea
+  #   http://127.0.0.1:8091/mcp  -> Plane
+  # =========================================================================
+  gitea-mcp:
+    image: docker.gitea.com/gitea-mcp-server
+    container_name: gitea-mcp
+    # This image has no ENTRYPOINT (Cmd is /app/gitea-mcp), so argv is explicit.
+    command: ["/app/gitea-mcp", "-t", "http", "-b", "0.0.0.0", "-p", "8090"]
+    # The image ships its healthcheck as CMD-SHELL, but it is a distroless image
+    # with no /bin/sh, so it can never pass. Exec form + the real port does work.
+    healthcheck:
+      test: ["CMD", "/app/gitea-mcp", "-healthcheck", "-p", "8090"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    env_file:
+      - ./mcp.env
+    environment:
+      GITEA_HOST: http://gitea:3000
+    ports:
+      - "127.0.0.1:8090:8090"   # loopback only - never reachable off-host
+    depends_on:
+      - gitea
+    networks:
+      - sdlc-network
+    restart: unless-stopped
+
+  outline-mcp:
+    # Outline's server speaks Streamable HTTP natively, so no bridge is needed.
+    # See mcp/outline-gateway.Dockerfile
+    build:
+      context: ./mcp
+      dockerfile: outline-gateway.Dockerfile
+    image: sdlc-outline-mcp-gateway:local
+    container_name: outline-mcp
+    env_file:
+      - ./mcp.env
+    ports:
+      - "127.0.0.1:8092:8092"   # loopback only
+    depends_on:
+      - outline-wiki
+    networks:
+      - sdlc-network
+    restart: unless-stopped
+
+  plane-mcp:
+    # Plane's own `http` mode cannot start on Community Edition (it requires an
+    # OAuth app), so stdio runs behind supergateway. See mcp/plane-gateway.Dockerfile
+    build:
+      context: ./mcp
+      dockerfile: plane-gateway.Dockerfile
+    image: sdlc-plane-mcp-gateway:local
+    container_name: plane-mcp
+    env_file:
+      - ./mcp.env
+    environment:
+      PLANE_BASE_URL: http://proxy
+    ports:
+      - "127.0.0.1:8091:8091"   # loopback only
+    depends_on:
+      - api
+      - proxy
+    networks:
+      - sdlc-network
+    restart: unless-stopped
+
+  # =========================================================================
+  # 🚀 ENGINE 3: OUTLINE (Wiki Knowledge Base) with Local Dex OIDC Auth
+  # =========================================================================
+  outline-db:
+    image: postgres:15-alpine
+    container_name: outline-postgres
+    environment:
+      POSTGRES_USER: outline_user
+      POSTGRES_PASSWORD: ${OUTLINE_POSTGRES_PASSWORD:?Set OUTLINE_POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: outline_wiki
+    volumes:
+      - outline_postgres_data:/var/lib/postgresql/data
+    networks:
+      - sdlc-network
+    restart: unless-stopped
+
+  outline-redis:
+    image: redis:7-alpine
+    container_name: outline-redis
+    volumes:
+      - outline_redis_data:/data
+    networks:
+      - sdlc-network
+    restart: unless-stopped
+
+  outline-dex-auth:
+    image: ghcr.io/dexidp/dex:v2.38.0
+    container_name: outline-dex
+    # Image default CMD is `dex serve /etc/dex/config.docker.yaml`,
+    # so our own config has to be named explicitly.
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    volumes:
+      - ./dex-config.yml:/etc/dex/config.yaml:ro
+    ports:
+      - "5556:5556"
+    networks:
+      - sdlc-network
+    restart: unless-stopped
+
+  outline-wiki:
+    image: docker.getoutline.com/outlinewiki/outline:latest
+    container_name: sdlc-outline
+    # Runtime image has node only (no yarn/npm): call the migration CLI and the
+    # Next.js standalone server directly. (package.json maps db:migrate -> sequelize db:migrate)
+    command: sh -c "node_modules/.bin/sequelize db:migrate --env production-ssl-disabled && node build/server/index.js"
+    ports:
+      - "8888:3030"
+    depends_on:
+      - outline-db
+      - outline-redis
+      - outline-dex-auth
+    environment:
+      - NODE_ENV=production
+      # Our Postgres has no TLS. The app only skips SSL when PGSSLMODE=disable
+      # (build/server/storage/database.js). NODE_ENV must stay `production` -- the
+      # app validates it against development|production|staging|test.
+      - PGSSLMODE=disable
+      - SECRET_KEY=${OUTLINE_SECRET_KEY:?Set OUTLINE_SECRET_KEY in .env}
+      - UTILS_SECRET=${OUTLINE_UTILS_SECRET:?Set OUTLINE_UTILS_SECRET in .env}
+      - DATABASE_URL=postgres://outline_user:${OUTLINE_POSTGRES_PASSWORD:?Set OUTLINE_POSTGRES_PASSWORD in .env}@outline-db:5432/outline_wiki
+      - REDIS_URL=redis://outline-redis:6379/0
+      - URL=http://localhost:8888
+      - PORT=3030
+      - FORCE_HTTPS=false
+      # Local File Storage Bypass (No AWS S3 required)
+      - FILE_STORAGE=local
+      - FILE_STORAGE_LOCAL_ROOT_DIR=/var/lib/outline/data
+      # Tricking Outline into Local OIDC auth via Dex
+      - OIDC_CLIENT_ID=outline-local
+      - OIDC_CLIENT_SECRET=${DEX_CLIENT_SECRET:?Set DEX_CLIENT_SECRET in .env}
+      - OIDC_AUTH_URI=http://localhost:5556/dex/auth
+      - OIDC_TOKEN_URI=http://outline-dex-auth:5556/dex/token
+      - OIDC_USERINFO_URI=http://outline-dex-auth:5556/dex/userinfo
+      - OIDC_DISPLAY_NAME=Local AI Sandbox Login
+    volumes:
+      - outline_storage_data:/var/lib/outline/data
+    networks:
+      - sdlc-network
+    restart: unless-stopped
